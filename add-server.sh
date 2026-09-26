@@ -6,12 +6,32 @@ INVENTORY="${SCRIPT_DIR}/inventory/servers.ini"
 VARS_FILE="${SCRIPT_DIR}/group_vars/all.yml"
 SSH_KEY="/root/.ssh/id_ed25519"
 
+bootstrap_via_old_master() {
+    local target_ip="$1" target_port="$2" old_master_ip="$3" old_master_port="$4"
+    read -rsp "Root пароль старого мастера (${old_master_ip}): " OLD_MASTER_PASS
+    echo
+
+    local new_master_pubkey
+    new_master_pubkey=$(cat "${SSH_KEY}.pub")
+    local new_master_ip
+    new_master_ip=$(curl -s ifconfig.me)
+
+    echo "Добавляю IP нового мастера (${new_master_ip}) в ssh_allow на целевом сервере через старый мастер..."
+    sshpass -p "$OLD_MASTER_PASS" ssh -o StrictHostKeyChecking=no -p "$old_master_port" root@"$old_master_ip" \
+        "ssh -o StrictHostKeyChecking=no -p ${target_port} root@${target_ip} 'ipset add ssh_allow ${new_master_ip} -exist'"
+
+    echo "Добавляю публичный ключ нового мастера в authorized_keys целевого сервера..."
+    sshpass -p "$OLD_MASTER_PASS" ssh -o StrictHostKeyChecking=no -p "$old_master_port" root@"$old_master_ip" \
+        "ssh -o StrictHostKeyChecking=no -p ${target_port} root@${target_ip} \"echo '${new_master_pubkey}' >> /root/.ssh/authorized_keys\""
+
+    echo "Ключ и IP успешно добавлены на целевой сервер через старый мастер."
+}
+
 add_one_server() {
     echo "=== Добавление нового сервера в управление Ansible ==="
     read -rp "Алиас сервера (короткое имя, например usa2): " SRV_NAME
     read -rp "IP адрес сервера: " SRV_IP
-    read -rsp "Root пароль сервера: " SRV_PASS
-    echo
+    read -rp "Сервер уже управлялся другим Ansible-мастером ранее? (y/n): " PREV_MANAGED
     read -rp "Домен для Let's Encrypt (Enter чтобы пропустить): " SRV_DOMAIN
     read -rp "Перезагрузить сервер после настройки? (y/n): " DO_REBOOT
 
@@ -24,14 +44,30 @@ add_one_server() {
         return
     fi
 
-    echo "[1/7] Копирую SSH ключ на новый сервер..."
-    sshpass -p "$SRV_PASS" ssh-copy-id -o StrictHostKeyChecking=no -i "${SSH_KEY}.pub" -p 22 root@"$SRV_IP"
+    local SRV_PORT
+
+    if [[ "$PREV_MANAGED" =~ ^[Yy]$ ]]; then
+        read -rp "Адрес старого мастера: " OLD_MASTER_IP
+        read -rp "SSH порт старого мастера (обычно 22022): " OLD_MASTER_PORT
+        OLD_MASTER_PORT="${OLD_MASTER_PORT:-22022}"
+        read -rp "SSH порт целевого сервера (обычно уже 22022, если мигрирован): " SRV_PORT
+        SRV_PORT="${SRV_PORT:-22022}"
+
+        echo "[1/7] Пробрасываю доступ через старый мастер..."
+        bootstrap_via_old_master "$SRV_IP" "$SRV_PORT" "$OLD_MASTER_IP" "$OLD_MASTER_PORT"
+    else
+        SRV_PORT=22
+        read -rsp "Root пароль сервера: " SRV_PASS
+        echo
+        echo "[1/7] Копирую SSH ключ на новый сервер..."
+        sshpass -p "$SRV_PASS" ssh-copy-id -o StrictHostKeyChecking=no -i "${SSH_KEY}.pub" -p 22 root@"$SRV_IP"
+    fi
 
     echo "[2/7] Добавляю сервер в инвентарь..."
     if ! grep -q "\[vps_servers\]" "$INVENTORY" 2>/dev/null; then
         echo "[vps_servers]" > "$INVENTORY"
     fi
-    sed -i "/\[vps_servers\]/a ${SRV_NAME} ansible_host=${SRV_IP} ansible_port=22 ansible_user=root" "$INVENTORY"
+    sed -i "/\[vps_servers\]/a ${SRV_NAME} ansible_host=${SRV_IP} ansible_port=${SRV_PORT} ansible_user=root" "$INVENTORY"
 
     echo "[3/7] Добавляю IP в общий whitelist static_whitelist_ips..."
     python3 - "$VARS_FILE" "$SRV_IP" <<'PYEOF'
@@ -52,13 +88,13 @@ if ip not in content:
         f.write(content)
 PYEOF
 
-    echo "[4/7] Настраиваю новый сервер (firewall, crowdsec, ssh hardening)..."
+    echo "[4/7] Настраиваю сервер (firewall, crowdsec, ssh hardening — идемпотентно)..."
     ansible-playbook "${SCRIPT_DIR}/playbooks/add-server.yml" \
         -i "$INVENTORY" \
         -e "target_host=${SRV_NAME}" \
         -e "target_domain=${SRV_DOMAIN}"
 
-    echo "[5/7] Обновляю порт SSH в инвентаре на 22022..."
+    echo "[5/7] Обновляю порт SSH в инвентаре на 22022 (если ещё не 22022)..."
     sed -i "s/^${SRV_NAME} ansible_host=${SRV_IP} ansible_port=22 /${SRV_NAME} ansible_host=${SRV_IP} ansible_port=22022 /" "$INVENTORY"
 
     echo "[6/7] Синхронизирую белые списки IP на всех серверах..."
