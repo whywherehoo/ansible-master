@@ -1,0 +1,38 @@
+#!/bin/bash
+set -euo pipefail
+
+DOMAINS=(
+{% for d in ddns_domains %}
+  "{{ d }}"
+{% endfor %}
+)
+
+HISTORY_DIR="/var/lib/ssh-whitelist"
+mkdir -p "$HISTORY_DIR"
+
+for domain in "${DOMAINS[@]}"; do
+    ip=$(dig +short @1.1.1.1 "$domain" | tail -n1)
+    if [[ -z "$ip" ]]; then
+        echo "$(date) : ${domain} не резолвится, пропускаю" >> /var/log/ssh-whitelist.log
+        continue
+    fi
+
+    hist_file="${HISTORY_DIR}/${domain}.history"
+    touch "$hist_file"
+
+    if grep -qx "$ip" "$hist_file"; then
+        continue
+    fi
+
+    echo "$ip" >> "$hist_file"
+    ipset add ssh_allow "$ip" -exist
+
+    line_count=$(wc -l < "$hist_file")
+    if [[ "$line_count" -gt 2 ]]; then
+        old_ip=$(head -n 1 "$hist_file")
+        tail -n 2 "$hist_file" > "${hist_file}.tmp"
+        mv "${hist_file}.tmp" "$hist_file"
+        ipset del ssh_allow "$old_ip" -exist
+        echo "$(date) : ${domain} сменил IP, удалён старый ${old_ip}" >> /var/log/ssh-whitelist.log
+    fi
+done

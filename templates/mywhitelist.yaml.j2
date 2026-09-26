@@ -1,0 +1,8 @@
+name: local/mywhitelist
+description: "Белый список собственных серверов и статических IP"
+whitelist:
+  reason: "Собственная инфраструктура"
+  ip:
+{% for ip in static_whitelist_ips %}
+    - "{{ ip }}"
+{% endfor %}

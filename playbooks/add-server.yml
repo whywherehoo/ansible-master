@@ -1,0 +1,194 @@
+---
+- name: Настройка нового сервера
+  hosts: "{{ target_host }}"
+  become: yes
+  vars:
+    target_domain: ""
+  tasks:
+
+    - name: Установить базовые пакеты
+      apt:
+        name:
+          - ipset
+          - iptables-persistent
+          - curl
+          - jq
+        state: present
+        update_cache: yes
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Преднастроить iptables-persistent без интерактивного вопроса
+      debconf:
+        name: iptables-persistent
+        question: "{{ item }}"
+        value: "true"
+        vtype: boolean
+      loop:
+        - iptables-persistent/autosave_v4
+        - iptables-persistent/autosave_v6
+
+    - name: Создать ipset ssh_allow
+      command: ipset create ssh_allow hash:ip -exist
+
+    - name: Добавить статические IP в ssh_allow
+      command: "ipset add ssh_allow {{ item }} -exist"
+      loop: "{{ static_whitelist_ips }}"
+
+    - name: Разрешить SSH на старом порту 22 только из ssh_allow
+      iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: 22
+        match_set: ssh_allow
+        match_set_flags: src
+        jump: ACCEPT
+        action: insert
+
+    - name: Разрешить SSH на новом порту только из ssh_allow
+      iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "{{ ssh_new_port }}"
+        match_set: ssh_allow
+        match_set_flags: src
+        jump: ACCEPT
+        action: insert
+
+    - name: Заблокировать SSH порты для всех остальных источников
+      iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "{{ item }}"
+        jump: DROP
+      loop:
+        - 22
+        - "{{ ssh_new_port }}"
+
+    - name: Default DROP policy в конец INPUT
+      iptables:
+        chain: INPUT
+        jump: DROP
+        action: append
+
+    - name: Сохранить правила iptables
+      command: netfilter-persistent save
+
+    - name: Создать директорию /opt/scripts
+      file:
+        path: /opt/scripts
+        state: directory
+        mode: '0755'
+
+    - name: Залить скрипт обновления DDNS whitelist
+      template:
+        src: "{{ playbook_dir }}/../templates/update-ssh-whitelist.sh.j2"
+        dest: /opt/scripts/update-ssh-whitelist.sh
+        mode: '0755'
+
+    - name: Залить systemd unit'ы таймера
+      template:
+        src: "{{ playbook_dir }}/../templates/{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+      loop:
+        - ssh-ddns-allow.service
+        - ssh-ddns-allow.timer
+
+    - name: Включить и запустить таймер whitelist
+      systemd:
+        name: ssh-ddns-allow.timer
+        enabled: yes
+        state: started
+        daemon_reload: yes
+
+    - name: Установить CrowdSec (native install)
+      shell: curl -s https://install.crowdsec.net | bash
+      args:
+        creates: /usr/bin/cscli
+
+    - name: Установить crowdsec и firewall-bouncer
+      apt:
+        name:
+          - crowdsec
+          - crowdsec-firewall-bouncer-iptables
+        state: present
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Ограничить bouncer только цепочкой INPUT (без DOCKER-USER)
+      copy:
+        dest: /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
+        content: |
+          mode: iptables
+          iptables_chains:
+            - INPUT
+          update_frequency: 10s
+          daemonize: true
+          log_mode: file
+          log_dir: /var/log/
+          log_level: info
+        backup: yes
+
+    - name: Установить базовые коллекции CrowdSec
+      command: "cscli collections install {{ item }}"
+      loop:
+        - crowdsecurity/linux
+        - crowdsecurity/sshd
+
+    - name: Залить кастомный whitelist-парсер по своим IP
+      template:
+        src: "{{ playbook_dir }}/../templates/mywhitelist.yaml.j2"
+        dest: /etc/crowdsec/parsers/s02-enrich/mywhitelist.yaml
+
+    - name: Перезапустить crowdsec и bouncer
+      systemd:
+        name: "{{ item }}"
+        state: restarted
+        enabled: yes
+      loop:
+        - crowdsec
+        - crowdsec-firewall-bouncer
+
+    - name: Сменить порт SSH в sshd_config
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?Port '
+        line: "Port {{ ssh_new_port }}"
+
+    - name: Создать директорию override для ssh.socket
+      file:
+        path: /etc/systemd/system/ssh.socket.d
+        state: directory
+        mode: '0755'
+
+    - name: Залить override ssh.socket (Ubuntu 24 socket activation)
+      copy:
+        dest: /etc/systemd/system/ssh.socket.d/override.conf
+        content: |
+          [Socket]
+          ListenStream=
+          ListenStream={{ ssh_new_port }}
+        mode: '0644'
+
+    - name: Перезапустить ssh.socket и ssh.service
+      systemd:
+        name: "{{ item }}"
+        state: restarted
+        daemon_reload: yes
+      loop:
+        - ssh.socket
+        - ssh.service
+
+    - name: Получить сертификат Let's Encrypt
+      when: target_domain is defined and target_domain | length > 0
+      block:
+        - name: Установить certbot
+          apt:
+            name: certbot
+            state: present
+        - name: Получить сертификат standalone
+          command: >
+            certbot certonly --standalone --non-interactive --agree-tos
+            -m admin@{{ target_domain }} -d {{ target_domain }}
+          args:
+            creates: "/etc/letsencrypt/live/{{ target_domain }}/fullchain.pem"

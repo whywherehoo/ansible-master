@@ -1,0 +1,8 @@
+static_whitelist_ips: []
+
+ssh_new_port: 22022
+
+ddns_domains: []
+
+crowdsec_telegram_bot_token: ""
+crowdsec_telegram_chat_id: ""

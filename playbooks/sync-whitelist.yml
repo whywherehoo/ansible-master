@@ -1,0 +1,19 @@
+---
+- name: Синхронизация белых списков IP на всех управляемых серверах
+  hosts: vps_servers
+  become: yes
+  tasks:
+
+    - name: Обновить ipset ssh_allow актуальным списком
+      command: "ipset add ssh_allow {{ item }} -exist"
+      loop: "{{ static_whitelist_ips }}"
+
+    - name: Обновить crowdsec whitelist-парсер
+      template:
+        src: "{{ playbook_dir }}/../templates/mywhitelist.yaml.j2"
+        dest: /etc/crowdsec/parsers/s02-enrich/mywhitelist.yaml
+
+    - name: Перезапустить crowdsec
+      systemd:
+        name: crowdsec
+        state: restarted
